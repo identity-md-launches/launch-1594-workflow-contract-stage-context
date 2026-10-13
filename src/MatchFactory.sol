@@ -10,10 +10,19 @@ import {Buyback} from "./Buyback.sol";
 ///
 /// Lifecycle: Open (players join, each with a commitment to a secret) → Revealing (every player
 /// reveals; the dice seed is the XOR of all secrets' hashes, so no single player picks it) → Playing
-/// (the game runs off chain with dice derived from the seed by RiskRules) → Settled (the ranking is
-/// signed by every player, or by the owner-configured seat outcome signer; the pot goes to PrizeVault).
+/// (the game runs off chain with dice derived from the seed by RiskRules) → Settled (the pot goes to
+/// PrizeVault). A match settles in one of three ways:
+///   1. unanimous: every player signs the ranking (`settle`);
+///   2. seat-attested: the seat outcome signer that was configured when the match was created signs
+///      it (`settle`); only this path draws from the bonus pool;
+///   3. optimistic: a player proposes the ranking (`proposeOutcome`); if no other player disputes it
+///      within DISPUTE_WINDOW anyone finalises it (`finalizeProposal`). A disputed match can still be
+///      settled by paths 1 or 2, otherwise it expires and refunds everyone.
 /// Failure paths refund by pull payment: an under-filled lobby, a player who never reveals (their entry
 /// is shared among those who did), and a match nobody settles in time.
+///
+/// `createMatch` takes the id the creator built their commitment for and reverts if another lobby took
+/// it first, so a creator's entry can never be bound to a commitment they cannot reveal.
 ///
 /// Entry can be paid in RISK: 10% is burned to 0x…dEaD and 90% is routed to IMD through Buyback; any
 /// IMD above the entry fee is returned to the player.
@@ -39,8 +48,19 @@ contract MatchFactory is Owned, ReentrancyGuard {
         uint64 joinDeadline;
         uint64 revealDeadline;
         uint64 playDeadline;
+        /// @dev Seat outcome signer snapshotted at creation; a later `setOutcomeSigner` never affects
+        /// a match that already took entries.
+        address outcomeSigner;
         bytes32 seed;
         uint256 pot;
+    }
+
+    /// @dev One optimistic settlement proposal per match.
+    struct Proposal {
+        bytes32 rankingHash;
+        address proposer;
+        uint64 proposedAt;
+        bool disputed;
     }
 
     address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
@@ -52,6 +72,8 @@ contract MatchFactory is Owned, ReentrancyGuard {
     uint256 public constant REVEAL_WINDOW = 10 minutes;
     uint256 public constant PLAY_WINDOW = 30 minutes;
     uint256 public constant SETTLE_GRACE = 1 days;
+    /// @notice Time the other players have to dispute a proposed ranking before it can be finalised.
+    uint256 public constant DISPUTE_WINDOW = 1 days;
     uint256 public constant RISK_ENTRY_BURN_BPS = 1_000;
     uint256 public constant BPS = 10_000;
 
@@ -70,6 +92,7 @@ contract MatchFactory is Owned, ReentrancyGuard {
     uint256 public totalRefundsOwed;
 
     mapping(uint256 => Match) internal _matches;
+    mapping(uint256 => Proposal) internal _proposals;
     mapping(uint256 => address[]) internal _players;
     mapping(uint256 => mapping(address => bytes32)) public commitOf;
     mapping(uint256 => mapping(address => bool)) public revealed;
@@ -82,6 +105,10 @@ contract MatchFactory is Owned, ReentrancyGuard {
     event SecretRevealed(uint256 indexed matchId, address indexed player);
     event MatchStarted(uint256 indexed matchId, bytes32 seed, uint256 playDeadline);
     event MatchSettled(uint256 indexed matchId, address[] ranking, bool seatAttested);
+    event OutcomeProposed(
+        uint256 indexed matchId, address indexed proposer, address[] ranking, uint256 disputeDeadline
+    );
+    event OutcomeDisputed(uint256 indexed matchId, address indexed player);
     event MatchCancelled(uint256 indexed matchId, uint8 reason);
     event RefundCredited(uint256 indexed matchId, address indexed player, uint256 amount);
     event RefundWithdrawn(address indexed player, uint256 amount);
@@ -103,6 +130,10 @@ contract MatchFactory is Owned, ReentrancyGuard {
     error OutcomeSignerNotConfigured();
     error InsufficientImdOut();
     error NothingToWithdraw();
+    error MatchIdMismatch(uint256 expected, uint256 actual);
+    error AlreadyProposed();
+    error NoProposal();
+    error ProposalPending();
 
     constructor(address initialOwner, address imdToken, address riskToken, address prizeVault, address buybackAddr)
         Owned(initialOwner)
@@ -119,7 +150,9 @@ contract MatchFactory is Owned, ReentrancyGuard {
 
     // ------------------------------------------------------------------ admin
 
-    /// @notice Seat outcome signer (the swarm seats' attestation key). Zero disables the seat path.
+    /// @notice Seat outcome signer (the swarm seats' attestation key) for matches created from now on.
+    /// Zero disables the seat path for new matches. Matches already created keep the signer they were
+    /// created with.
     function setOutcomeSigner(address signer) external onlyOwner {
         outcomeSigner = signer;
         emit OutcomeSignerSet(signer);
@@ -127,23 +160,32 @@ contract MatchFactory is Owned, ReentrancyGuard {
 
     // ------------------------------------------------------------------ lobby
 
+    /// @param expectedMatchId the id the creator read from `nextMatchId()` and built `commit` for.
+    /// Reverts with MatchIdMismatch if another lobby was created first, so the creator keeps their
+    /// entry and retries with the new id instead of holding a commitment they can never reveal.
     /// @param commit keccak256(abi.encode(matchId, player, secret)); see commitmentFor.
     /// @param riskIn 0 to pay the entry in IMD, otherwise RISK to route into IMD.
     /// @param minImdOut slippage bound for the RISK route (at least entryFee).
-    function createMatch(uint8 maxPlayers, uint96 entryFee, bytes32 commit, uint256 riskIn, uint256 minImdOut)
-        external
-        nonReentrant
-        returns (uint256 matchId)
-    {
+    function createMatch(
+        uint8 maxPlayers,
+        uint96 entryFee,
+        uint256 expectedMatchId,
+        bytes32 commit,
+        uint256 riskIn,
+        uint256 minImdOut
+    ) external nonReentrant returns (uint256 matchId) {
         if (maxPlayers < MIN_PLAYERS || maxPlayers > MAX_PLAYERS) revert InvalidPlayerCount();
         if (entryFee < MIN_ENTRY || entryFee > MAX_ENTRY) revert InvalidEntryFee();
-        matchId = nextMatchId++;
+        matchId = nextMatchId;
+        if (matchId != expectedMatchId) revert MatchIdMismatch(expectedMatchId, matchId);
+        nextMatchId = matchId + 1;
         Match storage m = _matches[matchId];
         m.creator = msg.sender;
         m.entryFee = entryFee;
         m.maxPlayers = maxPlayers;
         m.status = Status.Open;
         m.joinDeadline = uint64(block.timestamp + JOIN_WINDOW);
+        m.outcomeSigner = outcomeSigner;
         emit MatchCreated(matchId, msg.sender, maxPlayers, entryFee);
         _join(matchId, m, commit, riskIn, minImdOut);
     }
@@ -226,7 +268,8 @@ contract MatchFactory is Owned, ReentrancyGuard {
 
     /// @notice Settle with the final ranking (first, second[, third]); length is min(3, players).
     /// @param signatures either one signature per player in join order (unanimous), or a single
-    /// signature from the seat outcome signer. Seat-attested matches also draw from the bonus pool.
+    /// signature from the seat outcome signer the match was created with. Seat-attested matches also
+    /// draw from the bonus pool.
     function settle(uint256 matchId, address[] calldata ranking, bytes[] calldata signatures) external nonReentrant {
         Match storage m = _matches[matchId];
         if (m.status != Status.Playing) revert WrongStatus();
@@ -241,31 +284,67 @@ contract MatchFactory is Owned, ReentrancyGuard {
                 if (SigLib.recover(digest, signatures[i]) != players[i]) revert InvalidSignatures();
             }
         } else if (signatures.length == 1) {
-            address signer = outcomeSigner;
+            address signer = m.outcomeSigner;
             if (signer == address(0)) revert OutcomeSignerNotConfigured();
             if (SigLib.recover(digest, signatures[0]) != signer) revert InvalidSignatures();
             seatAttested = true;
         } else {
             revert InvalidSignatures();
         }
-
-        m.status = Status.Settled;
-        uint256 pot = m.pot;
-        m.pot = 0;
-        address[3] memory rank3;
-        for (uint256 i; i < ranking.length; ++i) {
-            rank3[i] = ranking[i];
-        }
-        imd.safeTransfer(address(vault), pot);
-        vault.awardMatch(matchId, rank3, ranking.length, pot, seatAttested);
-        emit MatchSettled(matchId, ranking, seatAttested);
+        _settle(matchId, m, ranking, seatAttested);
     }
 
-    /// @notice Refund every player of a match that was not settled within the grace period.
+    /// @notice Optimistic settlement, step 1: a player proposes the final ranking. The proposer's
+    /// consent is their transaction. Every other player has DISPUTE_WINDOW to dispute it; if nobody
+    /// does, anyone finalises it with `finalizeProposal`. One proposal per match.
+    function proposeOutcome(uint256 matchId, address[] calldata ranking) external nonReentrant {
+        Match storage m = _matches[matchId];
+        if (m.status != Status.Playing) revert WrongStatus();
+        if (block.timestamp > uint256(m.playDeadline) + SETTLE_GRACE) revert TooLate();
+        if (commitOf[matchId][msg.sender] == bytes32(0)) revert NotPlayer();
+        Proposal storage pr = _proposals[matchId];
+        if (pr.proposedAt != 0) revert AlreadyProposed();
+        _checkRanking(matchId, m, ranking);
+        pr.rankingHash = keccak256(abi.encode(ranking));
+        pr.proposer = msg.sender;
+        pr.proposedAt = uint64(block.timestamp);
+        emit OutcomeProposed(matchId, msg.sender, ranking, block.timestamp + DISPUTE_WINDOW);
+    }
+
+    /// @notice Optimistic settlement, step 2 (optional): any other player rejects the proposal. The
+    /// match can then only be settled unanimously or by the seat signer, or it expires and refunds.
+    function disputeOutcome(uint256 matchId) external nonReentrant {
+        Match storage m = _matches[matchId];
+        if (m.status != Status.Playing) revert WrongStatus();
+        Proposal storage pr = _proposals[matchId];
+        if (pr.proposedAt == 0 || pr.disputed) revert NoProposal();
+        if (block.timestamp > uint256(pr.proposedAt) + DISPUTE_WINDOW) revert TooLate();
+        if (commitOf[matchId][msg.sender] == bytes32(0)) revert NotPlayer();
+        if (msg.sender == pr.proposer) revert NotAuthorized();
+        pr.disputed = true;
+        emit OutcomeDisputed(matchId, msg.sender);
+    }
+
+    /// @notice Optimistic settlement, step 3: after the dispute window, anyone finalises an undisputed
+    /// proposal. Does not draw from the bonus pool.
+    function finalizeProposal(uint256 matchId, address[] calldata ranking) external nonReentrant {
+        Match storage m = _matches[matchId];
+        if (m.status != Status.Playing) revert WrongStatus();
+        Proposal storage pr = _proposals[matchId];
+        if (pr.proposedAt == 0 || pr.disputed) revert NoProposal();
+        if (block.timestamp <= uint256(pr.proposedAt) + DISPUTE_WINDOW) revert TooEarly();
+        if (keccak256(abi.encode(ranking)) != pr.rankingHash) revert InvalidRanking();
+        _settle(matchId, m, ranking, false);
+    }
+
+    /// @notice Refund every player of a match that was not settled within the grace period. An
+    /// undisputed proposal blocks this while the vault can pay it: finalise it instead.
     function expire(uint256 matchId) external nonReentrant {
         Match storage m = _matches[matchId];
         if (m.status != Status.Playing) revert WrongStatus();
         if (block.timestamp <= uint256(m.playDeadline) + SETTLE_GRACE) revert TooEarly();
+        Proposal storage pr = _proposals[matchId];
+        if (pr.proposedAt != 0 && !pr.disputed && vault.matchFactory() == address(this)) revert ProposalPending();
         _cancelAndRefundAll(matchId, m, 3);
     }
 
@@ -286,6 +365,10 @@ contract MatchFactory is Owned, ReentrancyGuard {
 
     function playersOf(uint256 matchId) external view returns (address[] memory) {
         return _players[matchId];
+    }
+
+    function getProposal(uint256 matchId) external view returns (Proposal memory) {
+        return _proposals[matchId];
     }
 
     function commitmentFor(uint256 matchId, address player, bytes32 secret) public pure returns (bytes32) {
@@ -352,6 +435,19 @@ contract MatchFactory is Owned, ReentrancyGuard {
                 if (ranking[j] == ranking[i]) revert InvalidRanking();
             }
         }
+    }
+
+    function _settle(uint256 matchId, Match storage m, address[] calldata ranking, bool seatAttested) private {
+        m.status = Status.Settled;
+        uint256 pot = m.pot;
+        m.pot = 0;
+        address[3] memory rank3;
+        for (uint256 i; i < ranking.length; ++i) {
+            rank3[i] = ranking[i];
+        }
+        imd.safeTransfer(address(vault), pot);
+        vault.awardMatch(matchId, rank3, ranking.length, pot, seatAttested);
+        emit MatchSettled(matchId, ranking, seatAttested);
     }
 
     function _cancelAndRefundAll(uint256 matchId, Match storage m, uint8 reason) private {

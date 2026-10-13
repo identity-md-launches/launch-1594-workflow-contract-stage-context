@@ -6,9 +6,13 @@ import {IERC20, SafeTransfer, Owned, ReentrancyGuard} from "./lib/Common.sol";
 /// @title PrizeVault
 /// @notice Pays match prizes in IMD only, by pull payment. Splits a settled match's prize 60/25/15
 /// (75/25 for two-player matches) and enforces the anti-farming cap: at most 3 rewarded placements per
-/// wallet in a rolling 24-hour window. A placement over the cap is not paid; its share goes to the bonus
-/// pool for later matches. Nothing is minted: every IMD paid out was deposited first.
-/// @dev The vault only accepts awards from the MatchFactory the owner links once after launch.
+/// wallet in any rolling 24-hour window. The vault keeps the timestamps of a wallet's last 3 rewarded
+/// placements; a new placement is paid only if the oldest of them is at least 24 hours old (each rewarded
+/// placement therefore has its own 24-hour cooldown). A placement over the cap is not paid; its share
+/// goes to the bonus pool for later matches. Nothing is minted: every IMD paid out was deposited first.
+/// @dev The vault only accepts awards from the MatchFactory the owner links once after launch. The bonus
+/// pool leaves the vault only through seat-attested settlements (`withBonus`), so the economy depends on
+/// the owner configuring the seat outcome signer in MatchFactory; the owner cannot withdraw it.
 contract PrizeVault is Owned, ReentrancyGuard {
     using SafeTransfer for IERC20;
 
@@ -28,8 +32,8 @@ contract PrizeVault is Owned, ReentrancyGuard {
     uint256 public bonusPool;
     uint256 public totalClaimable;
     mapping(address => uint256) public claimable;
-    mapping(address => uint64) public windowStart;
-    mapping(address => uint8) public winsInWindow;
+    /// @dev Timestamps of the wallet's last MAX_REWARDED_WINS_PER_WINDOW rewarded placements (0 = unused).
+    mapping(address => uint64[MAX_REWARDED_WINS_PER_WINDOW]) internal _rewardedAt;
 
     event MatchFactorySet(address indexed matchFactory);
     event BonusFunded(address indexed from, uint256 amount);
@@ -44,6 +48,7 @@ contract PrizeVault is Owned, ReentrancyGuard {
     error NothingToClaim();
     error ZeroAmount();
     error Underfunded();
+    error NotAContract();
 
     constructor(address initialOwner, address imdToken) Owned(initialOwner) {
         if (imdToken == address(0)) revert ZeroAddress();
@@ -51,9 +56,12 @@ contract PrizeVault is Owned, ReentrancyGuard {
     }
 
     /// @notice One-time link to the launch's MatchFactory (its address is in the deployment handoff).
+    /// The link is permanent: the owner must pass the deployed MatchFactory, and the address must be a
+    /// contract (a mistyped EOA would otherwise brick settlement for good).
     function setMatchFactory(address factory) external onlyOwner {
         if (factory == address(0)) revert ZeroAddress();
         if (matchFactory != address(0)) revert MatchFactoryAlreadySet();
+        if (factory.code.length == 0) revert NotAContract();
         matchFactory = factory;
         emit MatchFactorySet(factory);
     }
@@ -125,20 +133,44 @@ contract PrizeVault is Owned, ReentrancyGuard {
         emit Claimed(msg.sender, amount);
     }
 
-    /// @notice Rewarded placements still available to `player` in the current window.
-    function remainingRewardedWins(address player) external view returns (uint256) {
-        if (block.timestamp >= uint256(windowStart[player]) + WINDOW) return MAX_REWARDED_WINS_PER_WINDOW;
-        return MAX_REWARDED_WINS_PER_WINDOW - winsInWindow[player];
+    /// @notice Rewarded placements `player` can still be paid for right now: the number of slots whose
+    /// last rewarded placement is at least WINDOW old (or never used).
+    function remainingRewardedWins(address player) external view returns (uint256 free) {
+        uint64[MAX_REWARDED_WINS_PER_WINDOW] storage slots = _rewardedAt[player];
+        for (uint256 i; i < MAX_REWARDED_WINS_PER_WINDOW; ++i) {
+            if (block.timestamp >= uint256(slots[i]) + WINDOW) ++free;
+        }
     }
 
+    /// @notice Timestamps of `player`'s last rewarded placements (0 = unused slot).
+    function rewardedAt(address player) external view returns (uint64[MAX_REWARDED_WINS_PER_WINDOW] memory) {
+        return _rewardedAt[player];
+    }
+
+    /// @notice Earliest time at which `player` can be paid for another placement (now if a slot is free).
+    function nextRewardedWinAt(address player) external view returns (uint256) {
+        (, uint64 oldest) = _oldestSlot(player);
+        uint256 freeAt = uint256(oldest) + WINDOW;
+        return freeAt > block.timestamp ? freeAt : block.timestamp;
+    }
+
+    /// @dev Rolling cap: take the oldest of the player's last 3 rewarded placements; if it is at least
+    /// WINDOW old (or the slot is unused) the placement is paid and overwrites that slot.
     function _consumeRewardedWin(address player) private returns (bool) {
-        if (block.timestamp >= uint256(windowStart[player]) + WINDOW) {
-            windowStart[player] = uint64(block.timestamp);
-            winsInWindow[player] = 1;
-            return true;
-        }
-        if (winsInWindow[player] >= MAX_REWARDED_WINS_PER_WINDOW) return false;
-        ++winsInWindow[player];
+        (uint256 idx, uint64 oldest) = _oldestSlot(player);
+        if (block.timestamp < uint256(oldest) + WINDOW) return false;
+        _rewardedAt[player][idx] = uint64(block.timestamp);
         return true;
+    }
+
+    function _oldestSlot(address player) private view returns (uint256 idx, uint64 oldest) {
+        uint64[MAX_REWARDED_WINS_PER_WINDOW] storage slots = _rewardedAt[player];
+        oldest = slots[0];
+        for (uint256 i = 1; i < MAX_REWARDED_WINS_PER_WINDOW; ++i) {
+            if (slots[i] < oldest) {
+                oldest = slots[i];
+                idx = i;
+            }
+        }
     }
 }

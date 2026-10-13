@@ -77,6 +77,37 @@ contract RiskRulesTest is Test {
         assertEq(dl, 0);
     }
 
+    function test_unusedDiceSlotsAreIgnored() public pure {
+        // stale values beyond attackDice / defendDice must not take part in the comparison
+        (uint256 al, uint256 dl) = _cmp(1, 6, 0, 1, 3, 0, 1);
+        assertEq(al, 1);
+        assertEq(dl, 0);
+        (al, dl) = _cmp(1, 0, 6, 1, 3, 0, 1);
+        assertEq(al, 1);
+        assertEq(dl, 0);
+        (al, dl) = _cmp(2, 2, 6, 2, 1, 6, 1);
+        assertEq(al, 0);
+        assertEq(dl, 1);
+        (al, dl) = _cmp(4, 6, 1, 3, 5, 6, 1);
+        assertEq(al, 0);
+        assertEq(dl, 1);
+    }
+
+    function test_compareRejectsInvalidDiceCounts() public {
+        vm.expectRevert(RiskRules.InvalidDice.selector);
+        this.cmpExternal(0, 1);
+        vm.expectRevert(RiskRules.InvalidDice.selector);
+        this.cmpExternal(4, 1);
+        vm.expectRevert(RiskRules.InvalidDice.selector);
+        this.cmpExternal(1, 0);
+        vm.expectRevert(RiskRules.InvalidDice.selector);
+        this.cmpExternal(1, 3);
+    }
+
+    function cmpExternal(uint256 na, uint256 nd) external pure returns (uint256, uint256) {
+        return RiskRules.compare([1, 1, 1], na, [1, 1], nd);
+    }
+
     function test_highestDiceComparedPairwise() public pure {
         // attacker 6,4,1 vs defender 5,3 -> defender loses two
         (uint256 al, uint256 dl) = _cmp(1, 6, 4, 3, 3, 5, 2);

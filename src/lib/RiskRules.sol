@@ -73,12 +73,20 @@ library RiskRules {
         return compare(a, attackDice, d, defendDice);
     }
 
-    /// @notice Compare explicit dice (exposed for tests and replay). Defender wins ties.
+    /// @notice Compare explicit dice (exposed for tests and replay). Defender wins ties. Slots beyond
+    /// `attackDice` / `defendDice` are ignored whatever they hold.
     function compare(uint8[3] memory a, uint256 attackDice, uint8[2] memory d, uint256 defendDice)
         internal
         pure
         returns (uint256 attackerLosses, uint256 defenderLosses)
     {
+        if (attackDice == 0 || attackDice > MAX_ATTACK_DICE || defendDice == 0 || defendDice > MAX_DEFEND_DICE) {
+            revert InvalidDice();
+        }
+        for (uint256 i = attackDice; i < MAX_ATTACK_DICE; ++i) {
+            a[i] = 0;
+        }
+        if (defendDice == 1) d[1] = 0;
         _sortDesc3(a);
         if (defendDice == 2 && d[1] > d[0]) (d[0], d[1]) = (d[1], d[0]);
         uint256 pairs = attackDice < defendDice ? attackDice : defendDice;

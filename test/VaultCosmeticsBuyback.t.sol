@@ -13,7 +13,7 @@ contract PrizeVaultTest is Fixtures {
     function _playAndSettle(uint256 a, uint256 b) internal {
         uint256 id = mf.nextMatchId();
         vm.prank(p[a]);
-        mf.createMatch(2, FEE, _commit(id, a), 0, 0);
+        mf.createMatch(2, FEE, id, _commit(id, a), 0, 0);
         vm.prank(p[b]);
         mf.join(id, _commit(id, b), 0, 0);
         vm.prank(p[a]);
@@ -69,6 +69,56 @@ contract PrizeVaultTest is Fixtures {
         assertEq(vault.remainingRewardedWins(p[0]), 3);
         _playAndSettle(0, 5);
         assertEq(vault.claimable(p[0]), claimBefore + 15e18);
+    }
+
+    function test_rollingWindowCountsEachPlacementSeparately() public {
+        _linkVault();
+        uint256 t0 = block.timestamp;
+        _playAndSettle(0, 1); // paid at t0
+        assertEq(vault.claimable(p[0]), 15e18);
+        assertEq(vault.nextRewardedWinAt(p[0]), t0);
+        vm.warp(t0 + 24 hours - 1);
+        _playAndSettle(0, 2); // paid
+        _playAndSettle(0, 3); // paid
+        assertEq(vault.claimable(p[0]), 3 * 15e18);
+        assertEq(vault.remainingRewardedWins(p[0]), 0);
+        assertEq(vault.nextRewardedWinAt(p[0]), t0 + 24 hours);
+        _playAndSettle(0, 4); // 4th inside the window: forfeited
+        assertEq(vault.claimable(p[0]), 3 * 15e18);
+        assertEq(vault.bonusPool(), 15e18);
+
+        // one second later only the t0 slot has aged out: exactly one more placement is paid
+        vm.warp(t0 + 24 hours);
+        assertEq(vault.remainingRewardedWins(p[0]), 1);
+        _playAndSettle(0, 5);
+        assertEq(vault.claimable(p[0]), 4 * 15e18);
+        assertEq(vault.remainingRewardedWins(p[0]), 0);
+        _playAndSettle(0, 1);
+        _playAndSettle(0, 2);
+        assertEq(vault.claimable(p[0]), 4 * 15e18, "rolling cap: 3 paid placements in any 24h span");
+        assertEq(vault.bonusPool(), 3 * 15e18);
+        assertEq(vault.nextRewardedWinAt(p[0]), t0 + 48 hours - 1);
+        uint64[3] memory at = vault.rewardedAt(p[0]);
+        assertEq(uint256(at[0]), t0 + 24 hours);
+        assertEq(uint256(at[1]), t0 + 24 hours - 1);
+        assertEq(uint256(at[2]), t0 + 24 hours - 1);
+
+        // the two slots from t0+24h-1 free up together 24 hours after they were used
+        vm.warp(t0 + 48 hours - 1);
+        assertEq(vault.remainingRewardedWins(p[0]), 2);
+        assertEq(imd.balanceOf(address(vault)), vault.totalClaimable() + vault.bonusPool());
+    }
+
+    function test_setMatchFactoryRejectsNonContract() public {
+        vm.prank(owner);
+        vm.expectRevert(PrizeVault.NotAContract.selector);
+        vault.setMatchFactory(makeAddr("typo"));
+        vm.prank(owner);
+        vm.expectRevert(Owned.ZeroAddress.selector);
+        vault.setMatchFactory(address(0));
+        assertEq(vault.matchFactory(), address(0));
+        _linkVault();
+        assertEq(vault.matchFactory(), address(mf));
     }
 
     function test_bonusOnlyForSeatAttestedAndCapped() public {

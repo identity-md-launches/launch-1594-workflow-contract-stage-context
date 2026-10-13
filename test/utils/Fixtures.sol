@@ -142,7 +142,7 @@ abstract contract Fixtures is Test {
     function _openFull(uint8 n, uint96 fee) internal returns (uint256 id) {
         id = mf.nextMatchId();
         vm.prank(p[0]);
-        mf.createMatch(n, fee, _commit(id, 0), 0, 0);
+        mf.createMatch(n, fee, id, _commit(id, 0), 0, 0);
         for (uint256 i = 1; i < n; ++i) {
             vm.prank(p[i]);
             mf.join(id, _commit(id, i), 0, 0);

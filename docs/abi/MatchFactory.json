@@ -58,6 +58,19 @@
   },
   {
     "type": "function",
+    "name": "DISPUTE_WINDOW",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "JOIN_WINDOW",
     "inputs": [],
     "outputs": [
@@ -287,6 +300,11 @@
         "internalType": "uint96"
       },
       {
+        "name": "expectedMatchId",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
         "name": "commit",
         "type": "bytes32",
         "internalType": "bytes32"
@@ -313,6 +331,19 @@
   },
   {
     "type": "function",
+    "name": "disputeOutcome",
+    "inputs": [
+      {
+        "name": "matchId",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "domainSeparator",
     "inputs": [],
     "outputs": [
@@ -332,6 +363,24 @@
         "name": "matchId",
         "type": "uint256",
         "internalType": "uint256"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "finalizeProposal",
+    "inputs": [
+      {
+        "name": "matchId",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "ranking",
+        "type": "address[]",
+        "internalType": "address[]"
       }
     ],
     "outputs": [],
@@ -399,6 +448,11 @@
             "internalType": "uint64"
           },
           {
+            "name": "outcomeSigner",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
             "name": "seed",
             "type": "bytes32",
             "internalType": "bytes32"
@@ -407,6 +461,47 @@
             "name": "pot",
             "type": "uint256",
             "internalType": "uint256"
+          }
+        ]
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getProposal",
+    "inputs": [
+      {
+        "name": "matchId",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "tuple",
+        "internalType": "struct MatchFactory.Proposal",
+        "components": [
+          {
+            "name": "rankingHash",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "proposer",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "proposedAt",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "disputed",
+            "type": "bool",
+            "internalType": "bool"
           }
         ]
       }
@@ -548,6 +643,24 @@
       }
     ],
     "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "proposeOutcome",
+    "inputs": [
+      {
+        "name": "matchId",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "ranking",
+        "type": "address[]",
+        "internalType": "address[]"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
   },
   {
     "type": "function",
@@ -839,6 +952,56 @@
   },
   {
     "type": "event",
+    "name": "OutcomeDisputed",
+    "inputs": [
+      {
+        "name": "matchId",
+        "type": "uint256",
+        "indexed": true,
+        "internalType": "uint256"
+      },
+      {
+        "name": "player",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "OutcomeProposed",
+    "inputs": [
+      {
+        "name": "matchId",
+        "type": "uint256",
+        "indexed": true,
+        "internalType": "uint256"
+      },
+      {
+        "name": "proposer",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "ranking",
+        "type": "address[]",
+        "indexed": false,
+        "internalType": "address[]"
+      },
+      {
+        "name": "disputeDeadline",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "OutcomeSignerSet",
     "inputs": [
       {
@@ -1008,6 +1171,11 @@
   },
   {
     "type": "error",
+    "name": "AlreadyProposed",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "AlreadyRevealed",
     "inputs": []
   },
@@ -1058,6 +1226,27 @@
   },
   {
     "type": "error",
+    "name": "MatchIdMismatch",
+    "inputs": [
+      {
+        "name": "expected",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "actual",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "NoProposal",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "NotAuthorized",
     "inputs": []
   },
@@ -1079,6 +1268,11 @@
   {
     "type": "error",
     "name": "OutcomeSignerNotConfigured",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ProposalPending",
     "inputs": []
   },
   {
