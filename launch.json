@@ -1,0 +1,52 @@
+{
+  "kind": "evm_project",
+  "token": {
+    "contract": "LaunchToken",
+    "name": "IMD RISK",
+    "symbol": "RISK",
+    "decimals": 18
+  },
+  "contracts": [
+    {
+      "contract": "Buyback",
+      "constructorArgs": [
+        "$owner",
+        "0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127",
+        "$token"
+      ]
+    },
+    {
+      "contract": "PrizeVault",
+      "constructorArgs": [
+        "$owner",
+        "0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127"
+      ]
+    },
+    {
+      "contract": "MatchFactory",
+      "constructorArgs": [
+        "$owner",
+        "0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127",
+        "$token",
+        "$contract:PrizeVault",
+        "$contract:Buyback"
+      ]
+    },
+    {
+      "contract": "Cosmetics",
+      "constructorArgs": [
+        "$owner",
+        "0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127",
+        "$contract:PrizeVault",
+        "$contract:Buyback"
+      ]
+    }
+  ],
+  "pool": {
+    "pairedCurrency": "0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "IMD PEPE RISK: an unofficial community game. RISK (LaunchToken, src/LaunchToken.sol) is a plain fixed-supply ERC-20 and is NOT the IMD token. Contracts in constructor dependency order: Buyback(initialOwner, imdToken, riskToken) holds IMD routed from cosmetics sales, buys RISK through an owner-set swap venue and burns it to 0x...dEaD in the same transaction, and routes RISK entry fees into IMD; PrizeVault(initialOwner, imdToken) pays match prizes in IMD only by pull payment (60/25/15, 75/25 for two players) with a cap of 3 rewarded placements per wallet per rolling 24 hours; MatchFactory(initialOwner, imdToken, riskToken, prizeVault, buybackAddr) runs 2-6 player lobbies with IMD entry fees (or RISK routed to IMD with 10% of the RISK burned), commit-reveal dice seeds, signature settlement and pull refunds; Cosmetics(initialOwner, imdToken, prizeVault, buybackAddr) sells appearance-only items for IMD and splits each sale 30% to Buyback (20% burn share + 10% buyback share), 35% to the PrizeVault bonus pool and 35% to the owner-set seats/stakers recipient. Every initialOwner is $owner, the launch's owner; no contract makes msg.sender or tx.origin an owner. riskToken is $token. imdToken is 0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127, the IMD ERC-20 on Robinhood Chain (chain id 4663), which is also the pool's paired currency; it is immutable in all four contracts. Review finding carried forward from the README: the brief quotes 0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7 as IMD, which is not the launch chain's IMD, so the chain table address is used here and the independent review should confirm it. No constructor calls another contract, so all four deploy on an empty chain. No initialization calls: after launch the owner links PrizeVault.setMatchFactory to the deployed MatchFactory (one time), sets Buyback.setVenue to an ISwapVenue adapter, optionally sets MatchFactory.setOutcomeSigner, and sets Cosmetics.setSeatRewardsRecipient and configureItem. The pool pairs RISK with IMD; the factory opens it at the chain's 1.25% LaunchFees fee and derives the opening price from the policy's 2,500 IMD opening market cap. No application contract receives any of the supply at launch; Buyback and the vault only hold what users route or deposit later."
+}
