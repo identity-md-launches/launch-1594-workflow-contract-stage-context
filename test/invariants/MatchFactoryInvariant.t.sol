@@ -46,6 +46,13 @@ contract MatchHandler is Test {
     uint256 public ghostAwarded;
     uint256 public ghostForfeited;
     mapping(uint256 => MatchFactory.Status) public ghostTerminal;
+    mapping(uint256 => address) public ghostSignerAtCreation;
+    mapping(uint256 => bytes32) public ghostProposalHash;
+    mapping(uint256 => address) public ghostProposer;
+    mapping(uint256 => uint256) public ghostProposedAt;
+    mapping(uint256 => bool) public ghostDisputed;
+    mapping(uint256 => bool) public ghostFinalized;
+    mapping(uint256 => address[]) internal _proposedRanking;
     mapping(address => uint256[]) internal _rewardedAt;
     mapping(string => uint256) public calls;
 
@@ -95,11 +102,15 @@ contract MatchHandler is Test {
         bytes32 c = mf.commitmentFor(id, a, _secret(id, a));
         uint256 imdBefore = imd.balanceOf(a);
         uint256 mfBefore = imd.balanceOf(address(mf));
+        address signerNow = mf.outcomeSigner();
         vm.prank(a);
-        mf.createMatch(maxPlayers, uint96(fee), c, riskIn, minOut);
+        uint256 got = mf.createMatch(maxPlayers, uint96(fee), id, c, riskIn, minOut);
+        assertEq(got, id, "returned id is the expected id");
         assertEq(mf.nextMatchId(), id + 1, "match id");
         _afterJoin(a, fee, riskIn, imdBefore, mfBefore);
+        ghostSignerAtCreation[id] = signerNow;
         MatchFactory.Match memory m = mf.getMatch(id);
+        assertEq(m.outcomeSigner, signerNow, "seat signer snapshotted at creation");
         assertEq(m.creator, a);
         assertEq(m.playerCount, 1);
         assertEq(uint256(m.status), uint256(MatchFactory.Status.Open));
@@ -241,7 +252,7 @@ contract MatchHandler is Test {
         MatchFactory.Match memory m = mf.getMatch(id);
         if (block.timestamp > uint256(m.playDeadline) + mf.SETTLE_GRACE()) return;
         address[] memory ranking = _ranking(mf.playersOf(id), rankSeed);
-        bool seat = useSeat && mf.outcomeSigner() == seatSigner;
+        bool seat = useSeat && m.outcomeSigner == seatSigner;
         bytes[] memory sigs = _sigs(id, ranking, seat);
         uint256 poolBefore = vault.bonusPool();
         uint256 bonus;
@@ -267,7 +278,18 @@ contract MatchHandler is Test {
         uint256 id = _find(seed, MatchFactory.Status.Playing);
         if (id == 0) return;
         MatchFactory.Match memory m = mf.getMatch(id);
-        if (block.timestamp <= uint256(m.playDeadline) + mf.SETTLE_GRACE()) return;
+        uint256 graceEnd = uint256(m.playDeadline) + mf.SETTLE_GRACE();
+        MatchFactory.Proposal memory pr = mf.getProposal(id);
+        if (pr.proposedAt != 0 && !pr.disputed) {
+            // the vault is linked in this suite, so an undisputed proposal must block the refund path
+            // however long the match sits past its grace period
+            if (block.timestamp <= graceEnd) vm.warp(graceEnd + 1);
+            vm.expectRevert(MatchFactory.ProposalPending.selector);
+            mf.expire(id);
+            calls["expireBlocked"]++;
+            return;
+        }
+        if (block.timestamp <= graceEnd) return;
         address[] memory players = mf.playersOf(id);
         uint256[] memory before = new uint256[](players.length);
         for (uint256 i; i < players.length; ++i) {
@@ -280,6 +302,76 @@ contract MatchHandler is Test {
         }
         ghostCancelledPots += m.pot;
         ghostTerminal[id] = MatchFactory.Status.Cancelled;
+    }
+
+    function propose(uint256 seed, uint256 actorSeed, uint256 rankSeed) external {
+        calls["propose"]++;
+        uint256 id = _find(seed, MatchFactory.Status.Playing);
+        if (id == 0) return;
+        MatchFactory.Match memory m = mf.getMatch(id);
+        if (block.timestamp > uint256(m.playDeadline) + mf.SETTLE_GRACE()) return;
+        if (mf.getProposal(id).proposedAt != 0) return;
+        address[] memory players = mf.playersOf(id);
+        address proposer = players[actorSeed % players.length];
+        address[] memory ranking = _ranking(mf.playersOf(id), rankSeed);
+        vm.prank(proposer);
+        mf.proposeOutcome(id, ranking);
+        calls["proposeOk"]++;
+        MatchFactory.Proposal memory pr = mf.getProposal(id);
+        assertEq(pr.proposer, proposer, "proposer recorded");
+        assertEq(pr.proposedAt, block.timestamp, "proposal time recorded");
+        assertEq(pr.rankingHash, keccak256(abi.encode(ranking)), "ranking hash recorded");
+        assertFalse(pr.disputed, "fresh proposal is undisputed");
+        assertEq(mf.getMatch(id).pot, m.pot, "proposing moves no funds");
+        ghostProposalHash[id] = pr.rankingHash;
+        ghostProposer[id] = proposer;
+        ghostProposedAt[id] = block.timestamp;
+        _proposedRanking[id] = ranking;
+    }
+
+    function dispute(uint256 seed, uint256 actorSeed) external {
+        calls["dispute"]++;
+        uint256 id = _find(seed, MatchFactory.Status.Playing);
+        if (id == 0) return;
+        MatchFactory.Proposal memory pr = mf.getProposal(id);
+        if (pr.proposedAt == 0 || pr.disputed) return;
+        if (block.timestamp > uint256(pr.proposedAt) + mf.DISPUTE_WINDOW()) return;
+        address[] memory players = mf.playersOf(id);
+        address a = players[actorSeed % players.length];
+        if (a == pr.proposer) a = players[(actorSeed + 1) % players.length];
+        vm.prank(a);
+        mf.disputeOutcome(id);
+        calls["disputeOk"]++;
+        assertTrue(mf.getProposal(id).disputed, "marked disputed");
+        assertEq(uint256(mf.getMatch(id).status), uint256(MatchFactory.Status.Playing), "dispute keeps the match open");
+        ghostDisputed[id] = true;
+    }
+
+    function finalize(uint256 seed) external {
+        calls["finalize"]++;
+        uint256 id = _find(seed, MatchFactory.Status.Playing);
+        if (id == 0) return;
+        MatchFactory.Proposal memory pr = mf.getProposal(id);
+        if (pr.proposedAt == 0 || pr.disputed) return;
+        uint256 windowEnd = uint256(pr.proposedAt) + mf.DISPUTE_WINDOW();
+        if (block.timestamp <= windowEnd) {
+            // still inside the dispute window: finalising must fail, then let the window pass
+            vm.expectRevert(MatchFactory.TooEarly.selector);
+            mf.finalizeProposal(id, _proposedRanking[id]);
+            vm.warp(windowEnd + 1);
+        }
+        MatchFactory.Match memory m = mf.getMatch(id);
+        address[] memory ranking = _proposedRanking[id];
+        uint256 poolBefore = vault.bonusPool();
+        (uint256[] memory before, bool[] memory eligible) = _snapshot(ranking);
+        mf.finalizeProposal(id, ranking);
+        calls["finalizeOk"]++;
+        _checkAward(id, ranking, m.pot, before, eligible);
+        assertEq(vault.bonusPool(), poolBefore + (m.pot - _sumAwarded(ranking, before)), "finalize draws no bonus");
+        assertEq(mf.getMatch(id).pot, 0, "pot cleared");
+        ghostSettledPots += m.pot;
+        ghostFinalized[id] = true;
+        ghostTerminal[id] = MatchFactory.Status.Settled;
     }
 
     function withdrawRefund(uint256 actorSeed) external {
@@ -330,8 +422,12 @@ contract MatchHandler is Test {
 
     function warp(uint256 delta) external {
         calls["warp"]++;
-        // Mostly short hops so lobbies fill and reveal; sometimes past every window so expiry paths run.
-        delta = delta % 5 == 0 ? bound(delta, 0, 40 hours) : bound(delta, 0, 20 minutes);
+        // Mostly short hops so lobbies fill, reveal and settle; sometimes past the reveal or play window
+        // so the cancel and expiry paths run; now and then past a whole dispute and cap window.
+        uint256 kind = delta % 10;
+        if (kind < 6) delta = bound(delta, 1, 3 minutes);
+        else if (kind < 9) delta = bound(delta, 1, 45 minutes);
+        else delta = bound(delta, 1, 40 hours);
         vm.warp(block.timestamp + delta);
     }
 
@@ -515,7 +611,7 @@ contract MatchFactoryInvariantTest is StdInvariant, Test {
         }
 
         targetContract(address(h));
-        bytes4[] memory sel = new bytes4[](12);
+        bytes4[] memory sel = new bytes4[](15);
         sel[0] = MatchHandler.createMatch.selector;
         sel[1] = MatchHandler.join.selector;
         sel[2] = MatchHandler.startReveal.selector;
@@ -528,6 +624,9 @@ contract MatchFactoryInvariantTest is StdInvariant, Test {
         sel[9] = MatchHandler.fundBonus.selector;
         sel[10] = MatchHandler.setSeatSigner.selector;
         sel[11] = MatchHandler.warp.selector;
+        sel[12] = MatchHandler.propose.selector;
+        sel[13] = MatchHandler.dispute.selector;
+        sel[14] = MatchHandler.finalize.selector;
         targetSelector(FuzzSelector({addr: address(h), selectors: sel}));
     }
 
@@ -638,18 +737,67 @@ contract MatchFactoryInvariantTest is StdInvariant, Test {
     /// forge-config: default.invariant.depth = 80
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_rewardedPlacementsCappedPerWindow() public view {
+        uint256 window = vault.WINDOW();
         for (uint256 i; i < 6; ++i) {
             address a = h.actors(i);
-            uint256 start = vault.windowStart(a);
-            uint256 inWindow;
             uint256 total = h.rewardedCount(a);
-            for (uint256 k; k < total; ++k) {
-                uint256 ts = h.rewardedAt(a, k);
-                if (ts >= start && ts < start + vault.WINDOW()) ++inWindow;
+            // rolling cap: any four consecutive paid placements span at least 24 hours
+            for (uint256 k; k + 3 < total; ++k) {
+                assertGe(h.rewardedAt(a, k + 3), h.rewardedAt(a, k) + window, "4 rewarded placements inside 24h");
             }
-            assertLe(inWindow, vault.MAX_REWARDED_WINS_PER_WINDOW(), "at most 3 rewarded placements per window");
-            assertEq(inWindow, vault.winsInWindow(a), "window counter matches paid placements");
-            assertLe(uint256(vault.winsInWindow(a)), vault.MAX_REWARDED_WINS_PER_WINDOW());
+            // the vault's slots are exactly the last three paid placements
+            uint64[3] memory slots = vault.rewardedAt(a);
+            uint256 n = total < 3 ? total : 3;
+            uint256 ghostSum;
+            uint256 ghostMax;
+            for (uint256 k = total - n; k < total; ++k) {
+                ghostSum += h.rewardedAt(a, k);
+                if (h.rewardedAt(a, k) > ghostMax) ghostMax = h.rewardedAt(a, k);
+            }
+            uint256 slotSum;
+            uint256 slotMax;
+            uint256 free;
+            for (uint256 k; k < 3; ++k) {
+                slotSum += slots[k];
+                if (slots[k] > slotMax) slotMax = slots[k];
+                if (block.timestamp >= uint256(slots[k]) + window) ++free;
+            }
+            assertEq(slotSum, ghostSum, "slots hold the last three paid placements");
+            assertEq(slotMax, ghostMax, "newest slot is the last paid placement");
+            assertEq(vault.remainingRewardedWins(a), free, "remaining view counts free slots");
+            uint256 nextAt = vault.nextRewardedWinAt(a);
+            assertGe(nextAt, block.timestamp);
+            if (free > 0) assertEq(nextAt, block.timestamp, "a free slot means now");
+            else assertGt(nextAt, block.timestamp, "no free slot means later");
+        }
+    }
+
+    /// forge-config: default.invariant.runs = 64
+    /// forge-config: default.invariant.depth = 80
+    /// forge-config: default.invariant.fail-on-revert = true
+    function invariant_proposalsAreImmutableAndSingle() public view {
+        uint256 n = mf.nextMatchId();
+        for (uint256 id = 1; id < n; ++id) {
+            MatchFactory.Proposal memory pr = mf.getProposal(id);
+            MatchFactory.Match memory m = mf.getMatch(id);
+            assertEq(m.outcomeSigner, h.ghostSignerAtCreation(id), "signer never changes after creation");
+            if (h.ghostProposalHash(id) == bytes32(0)) {
+                assertEq(pr.proposedAt, 0, "no proposal unless the handler made one");
+                assertFalse(h.ghostFinalized(id));
+                continue;
+            }
+            assertEq(pr.rankingHash, h.ghostProposalHash(id), "proposed ranking never changes");
+            assertEq(pr.proposer, h.ghostProposer(id), "proposer never changes");
+            assertEq(uint256(pr.proposedAt), h.ghostProposedAt(id), "proposal time never changes");
+            assertEq(pr.disputed, h.ghostDisputed(id), "dispute flag only set by a dispute");
+            if (h.ghostFinalized(id)) {
+                assertFalse(pr.disputed, "a disputed proposal is never finalised");
+                assertEq(uint256(m.status), uint256(MatchFactory.Status.Settled));
+            }
+            if (m.status == MatchFactory.Status.Playing && !pr.disputed) {
+                // an undisputed proposal is the only thing that keeps a match past its grace period
+                assertEq(m.pot, uint256(m.playerCount) * m.entryFee, "pot intact while a proposal is pending");
+            }
         }
     }
 

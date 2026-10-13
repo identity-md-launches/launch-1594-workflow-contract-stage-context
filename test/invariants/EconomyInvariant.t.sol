@@ -477,22 +477,29 @@ contract EconomyInvariantTest is StdInvariant, Test {
     /// forge-config: default.invariant.depth = 80
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_rewardedPlacementsCappedPerWindow() public view {
+        uint256 window = vault.WINDOW();
         for (uint256 i; i < 6; ++i) {
             address a = h.actors(i);
-            uint256 start = vault.windowStart(a);
-            uint256 inWindow;
             uint256 total = h.rewardedCount(a);
-            for (uint256 k; k < total; ++k) {
-                uint256 ts = h.rewardedAt(a, k);
-                if (ts >= start && ts < start + vault.WINDOW()) ++inWindow;
+            // rolling cap: any four consecutive paid placements span at least 24 hours
+            for (uint256 k; k + 3 < total; ++k) {
+                assertGe(h.rewardedAt(a, k + 3), h.rewardedAt(a, k) + window, "4 rewarded placements inside 24h");
             }
-            assertLe(inWindow, vault.MAX_REWARDED_WINS_PER_WINDOW(), "at most 3 rewarded placements per window");
-            assertEq(inWindow, vault.winsInWindow(a), "window counter matches paid placements");
-            assertEq(
-                vault.remainingRewardedWins(a),
-                block.timestamp >= start + vault.WINDOW() ? 3 : 3 - inWindow,
-                "remaining view agrees"
-            );
+            uint64[3] memory slots = vault.rewardedAt(a);
+            uint256 n = total < 3 ? total : 3;
+            uint256 ghostSum;
+            for (uint256 k = total - n; k < total; ++k) {
+                ghostSum += h.rewardedAt(a, k);
+            }
+            uint256 slotSum;
+            uint256 free;
+            for (uint256 k; k < 3; ++k) {
+                slotSum += slots[k];
+                if (block.timestamp >= uint256(slots[k]) + window) ++free;
+            }
+            assertEq(slotSum, ghostSum, "slots hold the last three paid placements");
+            assertEq(vault.remainingRewardedWins(a), free, "remaining view counts free slots");
+            assertEq(free == 0, vault.nextRewardedWinAt(a) > block.timestamp, "next-win view agrees");
         }
     }
 

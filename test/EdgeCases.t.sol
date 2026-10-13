@@ -25,11 +25,11 @@ contract MatchFactoryEdgeTest is Fixtures {
         bytes32 c1 = _commit(id + 1, 0);
         vm.startPrank(p[0]);
         vm.expectRevert(MatchFactory.InvalidEntryFee.selector);
-        mf.createMatch(2, min - 1, c0, 0, 0);
+        mf.createMatch(2, min - 1, id, c0, 0, 0);
         vm.expectRevert(MatchFactory.InvalidEntryFee.selector);
-        mf.createMatch(2, max + 1, c0, 0, 0);
-        mf.createMatch(2, min, c0, 0, 0);
-        mf.createMatch(2, max, c1, 0, 0);
+        mf.createMatch(2, max + 1, id, c0, 0, 0);
+        mf.createMatch(2, min, id, c0, 0, 0);
+        mf.createMatch(2, max, id + 1, c1, 0, 0);
         vm.stopPrank();
         assertEq(mf.getMatch(id).pot, min);
         assertEq(mf.getMatch(id + 1).pot, max);
@@ -54,7 +54,7 @@ contract MatchFactoryEdgeTest is Fixtures {
     function test_joinDeadlineIsInclusive() public {
         uint256 id = mf.nextMatchId();
         vm.prank(p[0]);
-        mf.createMatch(3, FEE, _commit(id, 0), 0, 0);
+        mf.createMatch(3, FEE, id, _commit(id, 0), 0, 0);
         vm.warp(mf.getMatch(id).joinDeadline);
         vm.prank(p[1]);
         mf.join(id, _commit(id, 1), 0, 0);
@@ -164,12 +164,14 @@ contract MatchFactoryEdgeTest is Fixtures {
         mf.settle(id, ranking, new bytes[](0));
     }
 
-    function test_seatSignerCanBeDisabledAndCannotPoseAsPlayer() public {
+    function test_seatSignerCannotPoseAsPlayerAndIsSnapshottedAtCreation() public {
         _linkVault();
         uint256 seatPk = 0x5EA7;
+        uint256 otherPk = 0x5EA8;
         vm.prank(owner);
         mf.setOutcomeSigner(vm.addr(seatPk));
         uint256 id = _openFull(2, FEE);
+        assertEq(mf.getMatch(id).outcomeSigner, vm.addr(seatPk), "signer snapshotted at creation");
         _revealAll(id, 2);
         address[] memory ranking = _ranking(1, 0, 0, 2);
         bytes32 digest = mf.outcomeDigest(id, ranking);
@@ -179,15 +181,53 @@ contract MatchFactoryEdgeTest is Fixtures {
         two[1] = _sign(seatPk, digest);
         vm.expectRevert(MatchFactory.InvalidSignatures.selector);
         mf.settle(id, ranking, two);
-        // unanimous path still works with a seat signer configured
+        // rotating the signer afterwards does not let the new key settle this match ...
+        vm.prank(owner);
+        mf.setOutcomeSigner(vm.addr(otherPk));
+        bytes[] memory seat = new bytes[](1);
+        seat[0] = _sign(otherPk, digest);
+        vm.expectRevert(MatchFactory.InvalidSignatures.selector);
+        mf.settle(id, ranking, seat);
+        // ... and disabling it does not revoke the key this match was created with
         vm.prank(owner);
         mf.setOutcomeSigner(address(0));
-        bytes[] memory seat = new bytes[](1);
+        assertEq(mf.getMatch(id).outcomeSigner, vm.addr(seatPk));
         seat[0] = _sign(seatPk, digest);
+        mf.settle(id, ranking, seat);
+        assertEq(vault.claimable(p[1]), 15e18);
+    }
+
+    function test_matchCreatedBeforeSignerNeverGetsSeatPath() public {
+        _linkVault();
+        uint256 seatPk = 0x5EA7;
+        uint256 id = _openFull(2, FEE);
+        vm.prank(owner);
+        mf.setOutcomeSigner(vm.addr(seatPk));
+        _revealAll(id, 2);
+        address[] memory ranking = _ranking(0, 1, 0, 2);
+        bytes[] memory seat = new bytes[](1);
+        seat[0] = _sign(seatPk, mf.outcomeDigest(id, ranking));
         vm.expectRevert(MatchFactory.OutcomeSignerNotConfigured.selector);
         mf.settle(id, ranking, seat);
+        // a lobby opened after the key was set uses it
+        uint256 id2 = _openFull(2, FEE);
+        assertEq(mf.getMatch(id2).outcomeSigner, vm.addr(seatPk));
         mf.settle(id, ranking, _unanimous(id, ranking, 2));
-        assertEq(vault.claimable(p[1]), 15e18);
+    }
+
+    function test_createMatchRejectsStaleIdWithoutTakingEntry() public {
+        uint256 id = mf.nextMatchId();
+        vm.prank(p[1]);
+        mf.createMatch(2, FEE, id, _commit(id, 1), 0, 0);
+        uint256 before = imd.balanceOf(p[0]);
+        vm.prank(p[0]);
+        vm.expectRevert(abi.encodeWithSelector(MatchFactory.MatchIdMismatch.selector, id, id + 1));
+        mf.createMatch(2, FEE, id, _commit(id, 0), 0, 0);
+        assertEq(imd.balanceOf(p[0]), before);
+        assertEq(mf.nextMatchId(), id + 1, "a rejected create does not burn an id");
+        vm.prank(p[0]);
+        vm.expectRevert(abi.encodeWithSelector(MatchFactory.MatchIdMismatch.selector, 0, id + 1));
+        mf.createMatch(2, FEE, 0, _commit(id, 0), 0, 0);
     }
 
     function test_rankingWithZeroAddressRejected() public {
@@ -221,7 +261,7 @@ contract MatchFactoryEdgeTest is Fixtures {
         uint256 imdBefore = imd.balanceOf(p[0]);
         // 10 RISK: 1 burned, 9 routed at 1:1 = exactly the 9 IMD fee
         vm.prank(p[0]);
-        mf.createMatch(2, 9e18, _commit(id, 0), 10e18, 9e18);
+        mf.createMatch(2, 9e18, id, _commit(id, 0), 10e18, 9e18);
         assertEq(imd.balanceOf(p[0]), imdBefore);
         assertEq(imd.balanceOf(address(mf)), 9e18);
         assertEq(risk.balanceOf(DEAD), 1e18);
@@ -233,7 +273,7 @@ contract MatchFactoryEdgeTest is Fixtures {
         uint256 id = mf.nextMatchId();
         uint256 imdBefore = imd.balanceOf(p[0]);
         vm.prank(p[0]);
-        mf.createMatch(2, FEE, _commit(id, 0), 10e18, FEE);
+        mf.createMatch(2, FEE, id, _commit(id, 0), 10e18, FEE);
         // 9 RISK routed -> 18 IMD; fee 10 kept, 8 returned
         assertEq(imd.balanceOf(p[0]) - imdBefore, 8e18);
         assertEq(imd.balanceOf(address(mf)), FEE);
@@ -245,7 +285,7 @@ contract MatchFactoryEdgeTest is Fixtures {
         uint256 riskBefore = risk.balanceOf(p[0]);
         vm.prank(p[0]);
         vm.expectRevert(bytes("slippage"));
-        mf.createMatch(2, FEE, _commit(id, 0), 9, FEE);
+        mf.createMatch(2, FEE, id, _commit(id, 0), 9, FEE);
         assertEq(risk.balanceOf(p[0]), riskBefore);
         assertEq(risk.balanceOf(DEAD), 0);
         assertEq(mf.nextMatchId(), id);
@@ -260,7 +300,7 @@ contract MatchFactoryEdgeTest is Fixtures {
         uint256 id2 = mf.nextMatchId();
         vm.prank(p[0]);
         vm.expectRevert(ReentrancyGuard.Reentrancy.selector);
-        mf.createMatch(2, FEE, _commit(id2, 0), 20e18, FEE);
+        mf.createMatch(2, FEE, id2, _commit(id2, 0), 20e18, FEE);
         assertEq(mf.refunds(p[0]), FEE);
     }
 
@@ -298,7 +338,7 @@ contract PrizeVaultEdgeTest is Fixtures {
     function _settleTwo(uint256 a, uint256 b) internal {
         uint256 id = mf.nextMatchId();
         vm.prank(p[a]);
-        mf.createMatch(2, FEE, _commit(id, a), 0, 0);
+        mf.createMatch(2, FEE, id, _commit(id, a), 0, 0);
         vm.prank(p[b]);
         mf.join(id, _commit(id, b), 0, 0);
         vm.prank(p[a]);
@@ -400,24 +440,65 @@ contract PrizeVaultEdgeTest is Fixtures {
         assertEq(vault.claimable(p[4]), 15e18);
     }
 
-    function test_windowResetsExactlyAfter24h() public {
+    function test_rollingSlotsFreeExactly24hAfterEachPlacement() public {
         _linkVault();
-        uint256 start = block.timestamp;
+        uint256 t0 = block.timestamp;
+        // three rewarded placements one hour apart fill every slot
+        for (uint256 i; i < 3; ++i) {
+            vm.warp(t0 + i * 1 hours);
+            _settleTwo(0, 1 + i);
+        }
+        uint64[3] memory at = vault.rewardedAt(p[0]);
+        assertEq(uint256(at[0]) + at[1] + at[2], 3 * t0 + 3 hours, "slots hold the three timestamps");
+        assertEq(vault.nextRewardedWinAt(p[0]), t0 + 24 hours, "the oldest slot frees first");
+        vm.warp(t0 + 24 hours - 1);
+        assertEq(vault.remainingRewardedWins(p[0]), 0);
+        uint256 claimBefore = vault.claimable(p[0]);
+        uint256 poolBefore = vault.bonusPool();
+        _settleTwo(0, 4);
+        assertEq(vault.claimable(p[0]), claimBefore, "still capped one second before the oldest slot frees");
+        assertEq(vault.bonusPool() - poolBefore, 15e18, "the capped first place goes to the pool");
+        assertEq(vault.claimable(p[4]), 5e18, "the other placement is unaffected");
+        vm.warp(t0 + 24 hours);
+        assertEq(vault.remainingRewardedWins(p[0]), 1, "only the oldest slot is free");
+        _settleTwo(0, 5);
+        assertEq(vault.claimable(p[0]), claimBefore + 15e18);
+        assertEq(vault.remainingRewardedWins(p[0]), 0, "the freed slot is consumed");
+        assertEq(vault.nextRewardedWinAt(p[0]), t0 + 25 hours, "next free slot is the second placement's");
+        at = vault.rewardedAt(p[0]);
+        assertEq(uint256(at[0]) + at[1] + at[2], 3 * t0 + 27 hours, "the oldest slot was overwritten");
+    }
+
+    function test_fourthPlacementInTwentyFourHoursIsForfeitedEvenAsThird() public {
+        _linkVault();
         for (uint256 i; i < 3; ++i) {
             _settleTwo(0, 1 + i);
         }
-        assertEq(vault.windowStart(p[0]), start);
-        vm.warp(start + 24 hours - 1);
-        assertEq(vault.remainingRewardedWins(p[0]), 0);
         uint256 claimBefore = vault.claimable(p[0]);
-        _settleTwo(0, 4);
-        assertEq(vault.claimable(p[0]), claimBefore, "still capped one second before the window ends");
-        vm.warp(start + 24 hours);
-        assertEq(vault.remainingRewardedWins(p[0]), 3);
-        _settleTwo(0, 5);
-        assertEq(vault.claimable(p[0]), claimBefore + 15e18);
-        assertEq(vault.windowStart(p[0]), start + 24 hours);
-        assertEq(vault.winsInWindow(p[0]), 1);
+        uint256 poolBefore = vault.bonusPool();
+        // p0 third in a three-player match: the 15% share is forfeited, the others are paid
+        uint256 id = _openFull(3, FEE);
+        _revealAll(id, 3);
+        address[] memory ranking = _ranking(1, 2, 0, 3);
+        mf.settle(id, ranking, _unanimous(id, ranking, 3));
+        assertEq(vault.claimable(p[0]), claimBefore);
+        assertEq(vault.bonusPool() - poolBefore, 4.5e18);
+        assertEq(vault.claimable(p[1]), 5e18 + 18e18, "p1 keeps its earlier second place and adds first");
+        assertEq(imd.balanceOf(address(vault)), vault.totalClaimable() + vault.bonusPool());
+    }
+
+    function test_setMatchFactoryIsPermanentAndNeedsCode() public {
+        vm.prank(owner);
+        vm.expectRevert(PrizeVault.NotAContract.selector);
+        vault.setMatchFactory(p[0]);
+        _linkVault();
+        vm.prank(owner);
+        vm.expectRevert(PrizeVault.MatchFactoryAlreadySet.selector);
+        vault.setMatchFactory(address(this));
+        vm.prank(owner);
+        vm.expectRevert(PrizeVault.MatchFactoryAlreadySet.selector);
+        vault.setMatchFactory(address(mf));
+        assertEq(vault.matchFactory(), address(mf));
     }
 
     function test_claimTwiceReverts() public {
@@ -741,5 +822,306 @@ contract RiskRulesEdgeTest is Fixtures {
 
     function continentExt(uint256 c) external pure returns (uint256, uint256, uint256) {
         return RiskRules.continent(c);
+    }
+}
+
+/// @dev The optimistic propose / dispute / finalize round, driven by the inputs it should refuse:
+/// outsiders, repeats, the proposer disputing itself, both sides of every deadline, a ranking that is
+/// not the proposed one, and the interaction with expiry, signatures and an unlinked vault.
+contract OptimisticSettlementEdgeTest is Fixtures {
+    uint96 constant FEE = 10e18;
+
+    function _playing(uint8 n) internal returns (uint256 id) {
+        id = _openFull(n, FEE);
+        _revealAll(id, n);
+    }
+
+    function test_proposeRequiresPlayingStatusAndPlayer() public {
+        _linkVault();
+        uint256 id = _openFull(3, FEE);
+        address[] memory ranking = _ranking(0, 1, 2, 3);
+        vm.prank(p[0]);
+        vm.expectRevert(MatchFactory.WrongStatus.selector);
+        mf.proposeOutcome(id, ranking);
+        _revealAll(id, 3);
+        vm.prank(p[5]);
+        vm.expectRevert(MatchFactory.NotPlayer.selector);
+        mf.proposeOutcome(id, ranking);
+        vm.prank(owner);
+        vm.expectRevert(MatchFactory.NotPlayer.selector);
+        mf.proposeOutcome(id, ranking);
+        // malformed rankings: wrong length, outsider, duplicate
+        vm.startPrank(p[0]);
+        vm.expectRevert(MatchFactory.InvalidRanking.selector);
+        mf.proposeOutcome(id, _ranking(0, 1, 0, 2));
+        address[] memory outsider = _ranking(0, 1, 5, 3);
+        vm.expectRevert(MatchFactory.InvalidRanking.selector);
+        mf.proposeOutcome(id, outsider);
+        address[] memory dup = _ranking(0, 1, 1, 3);
+        vm.expectRevert(MatchFactory.InvalidRanking.selector);
+        mf.proposeOutcome(id, dup);
+        mf.proposeOutcome(id, ranking);
+        vm.expectRevert(MatchFactory.AlreadyProposed.selector);
+        mf.proposeOutcome(id, ranking);
+        vm.stopPrank();
+        // nobody else can propose a competing ranking either
+        vm.prank(p[1]);
+        vm.expectRevert(MatchFactory.AlreadyProposed.selector);
+        mf.proposeOutcome(id, _ranking(1, 0, 2, 3));
+        MatchFactory.Proposal memory pr = mf.getProposal(id);
+        assertEq(pr.proposer, p[0]);
+        assertEq(pr.proposedAt, block.timestamp);
+        assertEq(pr.rankingHash, keccak256(abi.encode(ranking)));
+        assertFalse(pr.disputed);
+    }
+
+    function test_proposeDeadlineIsTheSettleGraceInclusive() public {
+        _linkVault();
+        uint256 id = _playing(2);
+        uint256 edge = uint256(mf.getMatch(id).playDeadline) + mf.SETTLE_GRACE();
+        vm.warp(edge + 1);
+        vm.prank(p[0]);
+        vm.expectRevert(MatchFactory.TooLate.selector);
+        mf.proposeOutcome(id, _ranking(0, 1, 0, 2));
+        uint256 id2 = _playing(2);
+        vm.warp(uint256(mf.getMatch(id2).playDeadline) + mf.SETTLE_GRACE());
+        vm.prank(p[1]);
+        mf.proposeOutcome(id2, _ranking(1, 0, 0, 2));
+        // expire is now blocked for good while nobody disputes; finalize pays after the window
+        vm.warp(block.timestamp + mf.DISPUTE_WINDOW());
+        vm.expectRevert(MatchFactory.ProposalPending.selector);
+        mf.expire(id2);
+        vm.expectRevert(MatchFactory.TooEarly.selector);
+        mf.finalizeProposal(id2, _ranking(1, 0, 0, 2));
+        vm.warp(block.timestamp + 1);
+        vm.prank(p[5]); // anyone, not only a player
+        mf.finalizeProposal(id2, _ranking(1, 0, 0, 2));
+        assertEq(vault.claimable(p[1]), 15e18);
+        assertEq(vault.claimable(p[0]), 5e18);
+        assertEq(uint256(mf.getMatch(id2).status), uint256(MatchFactory.Status.Settled));
+    }
+
+    function test_disputeRules() public {
+        _linkVault();
+        uint256 id = _playing(3);
+        vm.prank(p[1]);
+        vm.expectRevert(MatchFactory.NoProposal.selector);
+        mf.disputeOutcome(id);
+        vm.prank(p[0]);
+        mf.proposeOutcome(id, _ranking(0, 1, 2, 3));
+        vm.prank(p[0]);
+        vm.expectRevert(MatchFactory.NotAuthorized.selector);
+        mf.disputeOutcome(id);
+        vm.prank(p[5]);
+        vm.expectRevert(MatchFactory.NotPlayer.selector);
+        mf.disputeOutcome(id);
+        uint256 edge = block.timestamp + mf.DISPUTE_WINDOW();
+        vm.warp(edge + 1);
+        vm.prank(p[2]);
+        vm.expectRevert(MatchFactory.TooLate.selector);
+        mf.disputeOutcome(id);
+        // a second match: dispute at the last second is accepted and is final
+        uint256 id2 = _playing(3);
+        vm.prank(p[0]);
+        mf.proposeOutcome(id2, _ranking(0, 1, 2, 3));
+        vm.warp(block.timestamp + mf.DISPUTE_WINDOW());
+        vm.prank(p[2]);
+        mf.disputeOutcome(id2);
+        assertTrue(mf.getProposal(id2).disputed);
+        vm.prank(p[1]);
+        vm.expectRevert(MatchFactory.NoProposal.selector);
+        mf.disputeOutcome(id2);
+        vm.warp(block.timestamp + 1);
+        vm.expectRevert(MatchFactory.NoProposal.selector);
+        mf.finalizeProposal(id2, _ranking(0, 1, 2, 3));
+        // no second proposal after a dispute: the disputed one still occupies the slot
+        vm.prank(p[2]);
+        vm.expectRevert(MatchFactory.AlreadyProposed.selector);
+        mf.proposeOutcome(id2, _ranking(2, 1, 0, 3));
+    }
+
+    function test_finalizeOnlyTheProposedRankingAndOnlyOnce() public {
+        _linkVault();
+        uint256 id = _playing(3);
+        address[] memory ranking = _ranking(2, 0, 1, 3);
+        vm.prank(p[2]);
+        mf.proposeOutcome(id, ranking);
+        vm.warp(block.timestamp + mf.DISPUTE_WINDOW() + 1);
+        vm.expectRevert(MatchFactory.InvalidRanking.selector);
+        mf.finalizeProposal(id, _ranking(2, 1, 0, 3));
+        vm.expectRevert(MatchFactory.InvalidRanking.selector);
+        mf.finalizeProposal(id, _ranking(2, 0, 0, 2));
+        vm.expectRevert(MatchFactory.InvalidRanking.selector);
+        mf.finalizeProposal(id, new address[](0));
+        uint256 potBefore = imd.balanceOf(address(mf));
+        mf.finalizeProposal(id, ranking);
+        assertEq(potBefore - imd.balanceOf(address(mf)), 30e18);
+        assertEq(vault.claimable(p[2]), 18e18);
+        assertEq(vault.claimable(p[0]), 7.5e18);
+        assertEq(vault.claimable(p[1]), 4.5e18);
+        vm.expectRevert(MatchFactory.WrongStatus.selector);
+        mf.finalizeProposal(id, ranking);
+        bytes[] memory sigs = _unanimous(id, ranking, 3);
+        vm.expectRevert(MatchFactory.WrongStatus.selector);
+        mf.settle(id, ranking, sigs);
+        vm.expectRevert(MatchFactory.WrongStatus.selector);
+        mf.expire(id);
+        vm.prank(p[0]);
+        vm.expectRevert(MatchFactory.WrongStatus.selector);
+        mf.disputeOutcome(id);
+    }
+
+    function test_finalizeNeverDrawsTheBonusPool() public {
+        _linkVault();
+        uint256 seatPk = 0x5EA7;
+        vm.prank(owner);
+        mf.setOutcomeSigner(vm.addr(seatPk));
+        imd.mint(address(this), 1_000e18);
+        imd.approve(address(vault), 1_000e18);
+        vault.fundBonus(1_000e18);
+        uint256 id = _playing(2);
+        vm.prank(p[0]);
+        mf.proposeOutcome(id, _ranking(0, 1, 0, 2));
+        vm.warp(block.timestamp + mf.DISPUTE_WINDOW() + 1);
+        mf.finalizeProposal(id, _ranking(0, 1, 0, 2));
+        assertEq(vault.bonusPool(), 1_000e18, "optimistic settlement leaves the pool alone");
+        assertEq(vault.claimable(p[0]) + vault.claimable(p[1]), 20e18);
+    }
+
+    function test_signaturesOverrideAPendingOrDisputedProposal() public {
+        _linkVault();
+        uint256 seatPk = 0x5EA7;
+        vm.prank(owner);
+        mf.setOutcomeSigner(vm.addr(seatPk));
+        // pending proposal, unanimous settlement with a different ranking wins
+        uint256 id = _playing(2);
+        vm.prank(p[0]);
+        mf.proposeOutcome(id, _ranking(0, 1, 0, 2));
+        address[] memory truth = _ranking(1, 0, 0, 2);
+        mf.settle(id, truth, _unanimous(id, truth, 2));
+        assertEq(vault.claimable(p[1]), 15e18);
+        vm.warp(block.timestamp + mf.DISPUTE_WINDOW() + 1);
+        vm.expectRevert(MatchFactory.WrongStatus.selector);
+        mf.finalizeProposal(id, _ranking(0, 1, 0, 2));
+        // disputed proposal, seat signer settles and draws the bonus
+        imd.mint(address(this), 100e18);
+        imd.approve(address(vault), 100e18);
+        vault.fundBonus(100e18);
+        uint256 id2 = _playing(2);
+        vm.prank(p[0]);
+        mf.proposeOutcome(id2, _ranking(0, 1, 0, 2));
+        vm.prank(p[1]);
+        mf.disputeOutcome(id2);
+        bytes[] memory seat = new bytes[](1);
+        seat[0] = _sign(seatPk, mf.outcomeDigest(id2, truth));
+        mf.settle(id2, truth, seat);
+        assertEq(vault.bonusPool(), 99e18, "seat settlement after a dispute still draws the bonus");
+        assertEq(vault.claimable(p[1]), 15e18 + 15.75e18);
+    }
+
+    function test_expireBlockedByPendingProposalUnlessDisputed() public {
+        _linkVault();
+        // A: an early proposal whose dispute window closes before the grace period ends
+        uint256 a = _playing(2);
+        vm.prank(p[0]);
+        mf.proposeOutcome(a, _ranking(0, 1, 0, 2));
+        uint256 graceEnd = uint256(mf.getMatch(a).playDeadline) + mf.SETTLE_GRACE();
+        vm.warp(block.timestamp + mf.DISPUTE_WINDOW() + 1);
+        assertLe(block.timestamp, graceEnd);
+        vm.prank(p[1]);
+        vm.expectRevert(MatchFactory.TooLate.selector);
+        mf.disputeOutcome(a);
+        vm.expectRevert(MatchFactory.TooEarly.selector);
+        mf.expire(a);
+        vm.warp(graceEnd + 1);
+        vm.expectRevert(MatchFactory.ProposalPending.selector);
+        mf.expire(a);
+        mf.finalizeProposal(a, _ranking(0, 1, 0, 2));
+        assertEq(vault.claimable(p[0]), 15e18);
+        // B: a disputed proposal does not block expiry
+        uint256 b = _playing(2);
+        vm.prank(p[0]);
+        mf.proposeOutcome(b, _ranking(0, 1, 0, 2));
+        vm.prank(p[1]);
+        mf.disputeOutcome(b);
+        vm.warp(uint256(mf.getMatch(b).playDeadline) + mf.SETTLE_GRACE());
+        vm.expectRevert(MatchFactory.TooEarly.selector);
+        mf.expire(b);
+        vm.warp(block.timestamp + 1);
+        mf.expire(b);
+        assertEq(mf.refunds(p[0]), FEE);
+        assertEq(mf.refunds(p[1]), FEE);
+        assertEq(uint256(mf.getMatch(b).status), uint256(MatchFactory.Status.Cancelled));
+        vm.warp(block.timestamp + mf.DISPUTE_WINDOW());
+        vm.expectRevert(MatchFactory.WrongStatus.selector);
+        mf.finalizeProposal(b, _ranking(0, 1, 0, 2));
+    }
+
+    function test_unlinkedVaultCannotFinalizeButCanExpire() public {
+        uint256 id = _playing(2);
+        vm.prank(p[1]);
+        mf.proposeOutcome(id, _ranking(1, 0, 0, 2));
+        vm.warp(uint256(mf.getMatch(id).playDeadline) + mf.SETTLE_GRACE() + 1);
+        vm.expectRevert(PrizeVault.MatchFactoryNotConfigured.selector);
+        mf.finalizeProposal(id, _ranking(1, 0, 0, 2));
+        assertEq(
+            uint256(mf.getMatch(id).status), uint256(MatchFactory.Status.Playing), "failed finalize changes nothing"
+        );
+        assertEq(imd.balanceOf(address(mf)), 2 * FEE);
+        mf.expire(id);
+        assertEq(mf.totalRefundsOwed(), 2 * FEE);
+    }
+
+    function test_proposalDoesNotBlockUnrelatedMatchesOrReuseAcrossIds() public {
+        _linkVault();
+        uint256 a = _playing(2);
+        uint256 b = _playing(2);
+        vm.prank(p[0]);
+        mf.proposeOutcome(a, _ranking(0, 1, 0, 2));
+        assertEq(mf.getProposal(b).proposedAt, 0);
+        vm.warp(uint256(mf.getMatch(b).playDeadline) + mf.SETTLE_GRACE() + 1);
+        mf.expire(b);
+        vm.expectRevert(MatchFactory.ProposalPending.selector);
+        mf.expire(a);
+        mf.finalizeProposal(a, _ranking(0, 1, 0, 2));
+        assertEq(vault.totalClaimable(), 20e18);
+        assertEq(mf.totalRefundsOwed(), 20e18);
+        assertEq(imd.balanceOf(address(mf)), 20e18);
+    }
+
+    function test_cappedProposerForfeitsOwnShareToPool() public {
+        _linkVault();
+        // p0 proposes itself first, then wins three other matches while the dispute window runs
+        uint256 id4 = _playing(2);
+        vm.prank(p[0]);
+        mf.proposeOutcome(id4, _ranking(0, 1, 0, 2));
+        vm.warp(block.timestamp + 23 hours);
+        for (uint256 i; i < 3; ++i) {
+            uint256 id = mf.nextMatchId();
+            vm.prank(p[0]);
+            mf.createMatch(2, FEE, id, _commit(id, 0), 0, 0);
+            vm.prank(p[2 + i]);
+            mf.join(id, _commit(id, 2 + i), 0, 0);
+            vm.prank(p[0]);
+            mf.reveal(id, _secret(0));
+            vm.prank(p[2 + i]);
+            mf.reveal(id, _secret(2 + i));
+            address[] memory r = _ranking(0, 2 + i, 0, 2);
+            bytes32 digest = mf.outcomeDigest(id, r);
+            bytes[] memory sigs = new bytes[](2);
+            sigs[0] = _sign(pks[0], digest);
+            sigs[1] = _sign(pks[2 + i], digest);
+            mf.settle(id, r, sigs);
+        }
+        assertEq(vault.remainingRewardedWins(p[0]), 0);
+        assertEq(vault.remainingRewardedWins(p[1]), 3);
+        vm.warp(block.timestamp + 1 hours + 1);
+        uint256 poolBefore = vault.bonusPool();
+        uint256 p0Before = vault.claimable(p[0]);
+        mf.finalizeProposal(id4, _ranking(0, 1, 0, 2));
+        assertEq(vault.claimable(p[0]), p0Before, "fourth placement in 24h pays nothing");
+        assertEq(vault.bonusPool() - poolBefore, 15e18, "only the proposer's share is forfeited");
+        assertEq(vault.claimable(p[1]), 5e18, "the uncapped runner-up is paid");
+        assertEq(imd.balanceOf(address(vault)), vault.totalClaimable() + vault.bonusPool());
     }
 }
